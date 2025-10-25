@@ -1780,3 +1780,36 @@ fn test_wrong_number_err_msg() {
         .fails()
         .stderr_contains("dd: invalid number: '1kBb555'\n");
 }
+
+#[test]
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(not(feature = "feat_selinux"))]
+fn test_oflag_direct_large_blocks_to_block_device() {
+    let ts = TestScenario::new(util_name!());
+
+    if !ts.fixtures.file_exists("/dev/sda") {
+        print!("Test skipped; no /dev/sda device found");
+        return;
+    }
+
+    let test_data = vec![0xAB; 1024 * 1024];
+    ts.fixtures.write_bytes("infile", &test_data);
+
+    if let Ok(result) = run_ucmd_as_root_with_stdin_stdout(
+        &ts,
+        &[
+            "if=infile",
+            "of=/dev/sda",
+            "oflag=direct",
+            "bs=1M",
+            "count=1",
+            "status=noxfer",
+        ],
+        None,
+        None,
+    ) {
+        result.success();
+    } else {
+        print!("Test skipped; requires root user or CI environment");
+    }
+}

@@ -28,7 +28,7 @@ use uucore::translate;
 
 use std::cmp;
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Stdout, Write};
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -1011,6 +1011,48 @@ fn flush_caches_full_length(i: &Input, o: &Output) -> io::Result<()> {
     Ok(())
 }
 
+/// Get the filesystem block size for a given path. Defaults to 4096.
+#[cfg(target_os = "linux")]
+fn get_block_size(path: &OsStr) -> usize {
+    use std::os::unix::fs::MetadataExt;
+
+    if let Ok(metadata) = std::fs::metadata(path) {
+        let blk_size = metadata.blksize() as usize;
+        if blk_size >= 512 && blk_size.is_power_of_two() {
+            return blk_size;
+        }
+    }
+    4096
+}
+
+/// Allocate a buffer aligned to the filesystem block size for O_DIRECT.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn allocate_aligned_buffer(size: usize, dest_path: &OsStr) -> Vec<u8> {
+    let alignment = get_block_size(dest_path);
+    let aligned_size = ((size + alignment - 1) / alignment) * alignment;
+
+    let mut buf = vec![BUF_INIT_BYTE; aligned_size];
+    let ptr = buf.as_mut_ptr() as usize;
+
+    if ptr % alignment != 0 {
+        // Vector not aligned, use posix_memalign for guaranteed alignment
+        unsafe {
+            use std::alloc::{Layout, alloc};
+            let layout = Layout::from_size_align(aligned_size, alignment).expect("invalid layout");
+            let aligned_ptr = alloc(layout);
+            if aligned_ptr.is_null() {
+                panic!("Failed to allocate aligned memory");
+            }
+            std::ptr::write_bytes(aligned_ptr, BUF_INIT_BYTE, aligned_size);
+            Vec::from_raw_parts(aligned_ptr, size, aligned_size)
+        }
+    } else {
+        // Vector already aligned, just truncate to requested size
+        buf.truncate(size);
+        buf
+    }
+}
+
 /// Copy the given input data to this output, consuming both.
 ///
 /// This method contains the main loop for the `dd` program. Bytes
@@ -1084,6 +1126,21 @@ fn dd_copy(mut i: Input, o: Output) -> io::Result<()> {
 
     // Create a common buffer with a capacity of the block size.
     // This is the max size needed.
+    // For O_DIRECT operations on Linux, allocate aligned memory.
+    #[cfg(target_os = "linux")]
+    let mut buf = if o.settings.oflags.direct || i.settings.iflags.direct {
+        let dest_path = o
+            .settings
+            .outfile
+            .as_deref()
+            .map(OsStr::new)
+            .unwrap_or_else(|| OsStr::new("/dev/stdout"));
+        allocate_aligned_buffer(bsize, dest_path)
+    } else {
+        vec![BUF_INIT_BYTE; bsize]
+    };
+
+    #[cfg(not(target_os = "linux"))]
     let mut buf = vec![BUF_INIT_BYTE; bsize];
 
     // Spawn a timer thread to provide a scheduled signal indicating when we
